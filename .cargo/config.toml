@@ -1,0 +1,24 @@
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --monitor --chip esp32 --log-format defmt"
+
+[env]
+DEFMT_LOG="info"
+
+SSID = "SSID"
+PASSWORD = "PASSWORD"
+SSID2 = "SSID"
+PASSWORD2 = "PASSWORD"
+STATIC_IP = "1.1.1.1 "
+GATEWAY_IP = "1.1.1.1"
+HOST_IP = "1.1.1.1"
+
+
+[build]
+rustflags = [
+  "-C", "link-arg=-nostartfiles",
+]
+
+target = "xtensa-esp32-none-elf"
+
+[unstable]
+build-std = ["alloc", "core"]
