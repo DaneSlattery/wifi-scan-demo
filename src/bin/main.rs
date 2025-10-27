@@ -6,25 +6,46 @@
     holding buffers for the duration of a data transfer."
 )]
 
+use core::cell::RefCell;
+use core::cmp::Ordering;
 use core::net::Ipv4Addr;
 use core::result;
 
+use alloc::borrow::ToOwned;
+use alloc::string::{String, ToString};
+use alloc::vec::{self, Vec};
+use anyhow::Error;
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Runner, StackResources};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
+use embedded_io::Read;
+use esp_bootloader_esp_idf::partitions::{self, FlashRegion};
+use esp_hal::peripherals::{self, Peripherals, WIFI};
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::{clock::CpuClock, rng::Rng};
-use esp_radio::wifi::{ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent};
+use esp_radio::wifi::{
+    AccessPointInfo, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent,
+};
 use esp_radio::{
     Controller,
     wifi::{self, ClientConfig},
 };
 use esp_rtos::embassy;
+use esp_storage::FlashStorage;
 use ieee80211::{match_frames, mgmt_frame::BeaconFrame};
+use serde::{Deserialize, Serialize};
+use wifi_scan_demo::persistence::{LOAD_WIFI, STORE_WIFI, persistence};
+use wifi_scan_demo::{PASSWORD, PASSWORD2, SSID, SSID2, WifiConfig, scan_and_score_wgs};
 use {esp_backtrace as _, esp_println as _};
 
+use embedded_storage::{ReadStorage, Storage};
+
+// use wifi_scan_demo::{WIFI_STARTED, scanner};
 extern crate alloc;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -41,10 +62,30 @@ macro_rules! mk_static {
     }};
 }
 
-const SSID: &str = env!("SSID");
-const PASSWORD: &str = env!("PASSWORD");
-const SSID2: &str = env!("SSID2");
-const PASSWORD2: &str = env!("PASSWORD2");
+// the system works as follows:
+// 1. start persistence loop
+//    - persistence loop will read NVS and fetch most recent connected access point, by bssid
+//      if one is not found, take the default as the starting config.
+//      Persistence then posts to a signal to notify other tasks that the wifi config is loaded
+// 2. start connect loop
+//    - connect loop will wait for persistence signal and then use those credentials to initialise the wifi
+//    - on first boot:
+//       - start wifi
+//       - connect loop will then scan up to 10 nearby AP's matching either of the known ssids
+//       - it will rank the nearby APs by signal strength (higher is better)
+//       - if the persisted config is there, it will rank that highest, so attempt that first
+//       - we can then go down the list of APs starting at the highest rank,
+//         - attempt to connect
+//           - if connection fails, try the next AP
+//           - if connection succeeds, the main loop will ping the web.
+//              - if pinging the web fails, it will send a disconnect signal
+//           - if we get the disconnect signal, try the next AP
+//       -
+//
+
+// pub static a: Mutex<CriticalSectionRawMutex,RefCell<[WifiConfig;10]>> = Mutex::new(RefCell::new([WifiConfig::new();10]));
+
+// next candidate wifi
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -84,14 +125,20 @@ async fn main(spawner: Spawner) -> ! {
         seed,
     );
 
+    // spawn other threads
+    spawner.spawn(persistence(peripherals.FLASH)).ok();
+    // LOAD_WIFI.signal(Some(WifiConfig {
+    //     bssid: [152, 72, 39, 34, 83, 255],
+    //     ssid: "It_hurts_when_IP_ext".to_string(),
+    //     signal_strength: -31,
+    // }));
+    // let wifi_shared = &*mk_static!(RefCell::<WifiController>, RefCell::new(_wifi_controller));
     spawner.spawn(connection(_wifi_controller)).ok();
     spawner.spawn(net_task(runner)).ok();
-    // TODO: Spawn some tasks
-    let _ = spawner;
 
     // todo: consider moving into separate task
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
+    let mut rx_buffer = [0; 1024];
+    let mut tx_buffer = [0; 1024];
 
     loop {
         if stack.is_link_up() {
@@ -134,27 +181,80 @@ async fn main(spawner: Spawner) -> ! {
 
         loop {
             use embedded_io_async::Write;
-            Write::write_all(
+            let r = Write::write_all(
                 &mut socket,
                 b"GET / HTTP/1.0\r\nHost: www.mobile-j.de\r\n\r\n",
             )
             .await;
+            if let Err(e) = r {
+                info!("Write Error {:?}", e);
+                break;
+            }
+
+            let n = match socket.read(&mut buf).await {
+                Ok(0) => {
+                    info!("eof");
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    info!("Read err: {:?}", e);
+                    break;
+                }
+            };
+
+            // if let Ok(num_bytes) = socket.read(&mut buf).await {
+            info!("{}", core::str::from_utf8(&buf[..n]).unwrap());
+            // break;
+            // }
             // let r = socket
             //     .write_all(b"GET / HTTP/1.0\r\nHost: www.mobile-j.de\r\n\r\n")
             //     .await;
-            info!("{}", core::str::from_utf8(&buf[..]).unwrap());
         }
         Timer::after(Duration::from_millis(3000)).await;
     }
-
+    info!("Something went terribly wrong");
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.1/examples/src/bin
+}
+
+// #[embassy_executor::task]
+// async fn scanner( controller: RefCell<WifiController<'static>>) -> ! {
+//     loop {
+//         //scan wgs
+//         let mut controller = controller.borrow_mut();
+//         scan_and_score_wgs(&mut controller).await;
+//     }
+// }
+
+fn get_client_config_from_ssid(wifi: &WifiConfig) -> ClientConfig {
+    if wifi.ssid == SSID {
+        ClientConfig::default()
+            .with_ssid(SSID.into())
+            .with_bssid(wifi.bssid)
+            .with_password(PASSWORD.into())
+    } else {
+        ClientConfig::default()
+            .with_ssid(SSID.into())
+            .with_bssid(wifi.bssid)
+            .with_password(PASSWORD2.into())
+    }
 }
 
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) -> ! {
     info!("Start connection task");
     info!("Device Capabilities: {:?}", controller.capabilities());
+    let default_config: ClientConfig = ClientConfig::default()
+        .with_ssid(SSID.into())
+        .with_password(PASSWORD.into());
 
+    let mut current_config = default_config.clone();
+    // persistence will load the previous connection from flash, if any
+    let persisted_config = LOAD_WIFI.wait().await;
+
+    let mut index = 0;
+    use alloc::vec;
+    let mut connection_queue: Vec<WifiConfig> = vec![];
     loop {
         match esp_radio::wifi::sta_state() {
             wifi::WifiStaState::Connected => {
@@ -170,32 +270,40 @@ async fn connection(mut controller: WifiController<'static>) -> ! {
         }
 
         if !matches!(controller.is_started(), Ok(true)) {
-            // todo: switch config based on WG signal strength
-            let client_config = ModeConfig::Client(
-                ClientConfig::default()
-                    .with_ssid(SSID.into())
-                    .with_password(PASSWORD.into()),
-            );
+            let client_config = ModeConfig::Client(current_config.clone());
             controller.set_config(&client_config).unwrap();
+
             info!("Starting wifi");
-            controller.start_async().await.unwrap();
+            if let Err(x) = controller.start_async().await {
+                info!("Error = {:?}", x);
+            };
             info!("Started wifi");
 
-            info!("scan");
+            let best_gws = scan_and_score_wgs(&mut controller).await;
 
-            let scan_conf = ScanConfig::default().with_max(10);
-            let result = controller.scan_with_config_async(scan_conf).await.unwrap();
-
-            for ap in result {
-                // todo: sort by signal strength
-                info!("{:?}", ap);
+            // check if current persisted config  is best
+            if let Some(p) = &persisted_config
+                && best_gws.contains(&p)
+            {
+                info!("Persisted Wifi found, using that...");
+                // already set
+            } else if let Some(best) = best_gws.first() {
+                info!("Persisted Wifi not found, using the best WG in scan...");
+                current_config = get_client_config_from_ssid(&best);
+                let client_config = ModeConfig::Client(current_config.clone());
+                controller.set_config(&client_config).unwrap();
+                STORE_WIFI.signal(best.clone());
             }
         }
+
+        // choose the next one in the connection queu
 
         info!("About to connect ...");
 
         match controller.connect_async().await {
-            Ok(_) => info!("Wifi Connected!"),
+            Ok(_) => {
+                info!("Wifi Connected!");
+            }
             Err(err) => {
                 info!("Failed to connect to wifi {:?}", err);
                 Timer::after(Duration::from_millis(5000)).await;

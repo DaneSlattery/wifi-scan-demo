@@ -20,7 +20,7 @@ esp-rtos = { version = "0.1.1", features = [
 ] }
 
 defmt                  = "1.0.1"
-esp-bootloader-esp-idf = { version = "0.3.0", features = ["esp32"] }
+esp-bootloader-esp-idf = { version = "0.3.0", features = ["esp32","defmt"] }
 
 embassy-net = { version = "0.7.0", features = [
   "defmt",
@@ -50,6 +50,7 @@ esp-radio = { version = "0.16.0", features = [
   "unstable",
   "wifi",
 ] }
+
 smoltcp = { version = "0.12.0", default-features = false, features = [
   "defmt",
   "medium-ethernet",
@@ -67,6 +68,15 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 ieee80211 = "0.5.9"
+
+
+anyhow={version ="*",default-features=false}
+esp-storage = {version = "0.8.0",features = ["esp32", "defmt"]}
+embedded-storage = "0.3.1"
+postcard = { version = "1.1.3", features = ["use-defmt"] }
+serde = { version = "1.0.*", default-features = false, features = ["alloc", "derive"] }
+embassy-sync = {version = "0.7.2",features = ["defmt"]}
+heapless = { version = "0.9.1", features = ["defmt", "alloc", "serde"] }
 
 
 [profile.dev]

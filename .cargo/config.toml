@@ -4,9 +4,9 @@ runner = "espflash flash --monitor --chip esp32 --log-format defmt"
 [env]
 DEFMT_LOG="info"
 
-SSID = "SSID"
-PASSWORD = "PASSWORD"
-SSID2 = "SSID"
+SSID = "It_hurts_when_IP_ext"
+PASSWORD = "cranberry juice"
+SSID2 = "It_hurts_when_IP"
 PASSWORD2 = "PASSWORD"
 STATIC_IP = "1.1.1.1 "
 GATEWAY_IP = "1.1.1.1"
