@@ -130,6 +130,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(persistence(peripherals.FLASH)).ok();
     spawner.spawn(connection(_wifi_controller)).ok();
     spawner.spawn(net_task(runner)).ok();
+    // spawner.spawn(very_busy_loop()).ok();
 
     // todo: consider moving into separate task
     let mut rx_buffer = [0; 1024];
@@ -188,15 +189,6 @@ async fn main(spawner: Spawner) -> ! {
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.1/examples/src/bin
 }
 
-// #[embassy_executor::task]
-// async fn scanner( controller: RefCell<WifiController<'static>>) -> ! {
-//     loop {
-//         //scan wgs
-//         let mut controller = controller.borrow_mut();
-//         scan_and_score_wgs(&mut controller).await;
-//     }
-// }
-
 /// we use the bssid to identify a specific WG, as multiple will advertise on same ssid
 fn get_client_config_from_candidate(wifi: &WifiConfig) -> ClientConfig {
     if wifi.ssid == KNOWN_CREDS.0.ssid {
@@ -226,8 +218,8 @@ async fn connection(mut controller: WifiController<'static>) -> ! {
     let persisted_config = LOAD_WIFI.wait().await;
     let mut current_candidate: Option<WifiConfig> = None;
 
-    let mut connection_queue: Vec<WifiConfig> = vec![];
-
+    let mut pick_new_candidate = true;
+    let mut scan = true;
     // connection state machine
     loop {
         match esp_radio::wifi::sta_state() {
@@ -239,21 +231,25 @@ async fn connection(mut controller: WifiController<'static>) -> ! {
                 let signal_disconnect = WG_CONNECT_STATUS.wait();
                 match embassy_futures::select::select(natural_disconnect, signal_disconnect).await {
                     embassy_futures::select::Either::First(_) => {
-                        info!("Detected disconnect")
+                        pick_new_candidate = true;
+                        info!("Detected disconnect");
                     }
                     embassy_futures::select::Either::Second(y) => match y {
                         true => {
+                            info!("Candidate healthy");
                             if let Some(ref mut x) = current_candidate {
                                 x.connect_success = Some(true);
                             } else {
                                 // there is no candidate, but clearly we're connected to something
                                 // https://github.com/esp-rs/esp-hal/issues/4401
                             };
+                            continue;
                         }
                         false => {
                             if let Some(ref mut x) = current_candidate {
                                 x.connect_success = Some(false);
                             }
+                            pick_new_candidate = true;
                             info!("Detected network instability");
                         }
                     },
@@ -278,21 +274,24 @@ async fn connection(mut controller: WifiController<'static>) -> ! {
                 info!("Error = {:?}", x);
             };
             info!("Started wifi");
-
+        }
+        if pick_new_candidate {
             // scan nearby
             // todo: do this at a regular cadence/ or when there are no candidates
-            let best_wgs = scan_and_score_wgs(&mut controller).await;
-
+            let mut best_wgs: Vec<WifiConfig> = vec![];
+            best_wgs = scan_and_score_wgs(&mut controller).await;
             // pick next candidate
             current_candidate = pick_next_candidate(best_wgs.first(), current_candidate.as_ref());
             info!("Candidate: {}", current_candidate);
             if let Some(best) = &current_candidate {
-                ModeConfig::Client(get_client_config_from_candidate(&best));
-                controller.set_config(&client_config).unwrap();
+                STORE_WIFI.signal(best.clone());
+                controller
+                    .set_config(&ModeConfig::Client(get_client_config_from_candidate(&best)))
+                    .unwrap();
             }
 
+            // need to timeout on this connect
             info!("About to connect ...");
-
             match controller.connect_async().await {
                 Ok(_) => {
                     info!("Wifi Connected!");
@@ -306,6 +305,8 @@ async fn connection(mut controller: WifiController<'static>) -> ! {
                     Timer::after(Duration::from_millis(5000)).await;
                 }
             }
+        } else {
+            Timer::after(Duration::from_millis(5000)).await;
         }
     }
 }
@@ -346,31 +347,15 @@ fn pick_next_candidate(
 
     current
 }
-// async fn scan_loop( controller: &mut WifiController<'static>, current_candidate:    Option<WifiConfig>)
-// {
 
-//     let best_wgs = scan_and_score_wgs(&mut controller).await;
-
-//     let best = best_wgs.first();
-//     // we are required to connect to the previous WG, although theoretically a better one could
-//     // have been found in the scan
-//     // check if current persisted config  is best
-//     if let Some(p) = &current_candidate
-//         && best_wgs.contains(&p)
-//     {
-//         info!("Persisted Wifi found, using that...");
-//         // already set
-//     } else if let Some(best) = best_wgs.first() {
-//         info!("Persisted Wifi not found, using the best WG in scan...");
-//         if (best > current_candidate)
-//         current_candidate = Some(best.clone());
-//         let conf = get_client_config_from_ssid(&best);
-//         let client_config = ModeConfig::Client(current_config.clone());
-//         controller.set_config(&client_config).unwrap();
-//         STORE_WIFI.signal(best.clone());
-//     }
-
-// }
+/// this can be enabled to show that our very busy loop can still run at a decent rate
+#[embassy_executor::task]
+async fn very_busy_loop() {
+    loop {
+        info!("-");
+        Timer::after(Duration::from_millis(20)).await
+    }
+}
 
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {

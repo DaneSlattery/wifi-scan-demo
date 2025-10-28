@@ -46,7 +46,7 @@ pub async fn persistence(flash: peripherals::FLASH<'static>) -> ! {
 
     // notify connection thread
     LOAD_WIFI.signal(conf);
-    let mut bytes = [0u8; 44];
+    let mut bytes = [0u8; 60];
     loop {
         info!("Waiting for new persistence");
         let conf: WifiConfig = STORE_WIFI.wait().await;
@@ -71,7 +71,7 @@ pub async fn persistence(flash: peripherals::FLASH<'static>) -> ! {
 pub async fn load_previous_wifi<'a>(
     nvs_partition: &mut FlashRegion<'_, FlashStorage<'_>>,
 ) -> Result<WifiConfig, anyhow::Error> {
-    let mut bytes = [0u8; 44];
+    let mut bytes = [0u8; 60];
     match nvs_partition.read(WIFI_CONFIG_ADDR, &mut bytes) {
         Ok(_) => info!("Read bytes {:02x}", &bytes),
         Err(x) => info!("Errror = {:?}", x),

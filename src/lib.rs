@@ -36,7 +36,7 @@ impl PartialEq for WifiConfig {
         self.bssid == other.bssid
     }
 }
-
+// test
 impl Ord for WifiConfig {
     fn cmp(&self, other: &Self) -> Ordering {
         // a wifi config
@@ -110,6 +110,7 @@ const PASSWORD2: &str = env!("PASSWORD2");
 const SCAN_COUNT: usize = 10;
 
 pub async fn scan_and_score_wgs(controller: &mut WifiController<'static>) -> Vec<WifiConfig> {
+    info!("Scanning...");
     // worst case scan time 20ms*SCAN_COUNT
     let scan_conf: ScanConfig<'_> = ScanConfig::default().with_max(SCAN_COUNT);
     let result = controller.scan_with_config_async(scan_conf).await.unwrap();
