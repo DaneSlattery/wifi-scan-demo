@@ -78,6 +78,7 @@ serde = { version = "1.0.*", default-features = false, features = ["alloc", "der
 embassy-sync = {version = "0.7.2",features = ["defmt"]}
 heapless = { version = "0.9.1", features = ["defmt", "alloc", "serde"] }
 embassy-futures = "0.1.2"
+oneshot = {version = "0.1.11",default-features = false,features = ["async"]}
 
 
 [profile.dev]

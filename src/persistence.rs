@@ -10,7 +10,7 @@ use esp_storage::FlashStorage;
 use crate::WifiConfig;
 
 // starting bit of nvs where the previous best lives
-const WIFI_CONFIG_ADDR: u32 = 0x0000;
+const WIFI_CONFIG_ADDR: u32 = 0;
 // number of bytes to clear before writing a sector
 const WIFI_CONFIG_SECTOR_SIZE: u32 = 4096;
 
@@ -46,13 +46,13 @@ pub async fn persistence(flash: peripherals::FLASH<'static>) -> ! {
 
     // notify connection thread
     LOAD_WIFI.signal(conf);
-    let mut bytes = [0u8; 60];
+    let mut bytes = [0xff; 60];
     loop {
         info!("Waiting for new persistence");
         let conf: WifiConfig = STORE_WIFI.wait().await;
         info!("Persisting current best WG {:?}", conf);
 
-        // note: erase a full sector of flash like this is bad, but this is a prototype
+        // note: erase a full sector of flash like this is bad, but this is a prototype.
         // ideally, one would use a key-value store with wear levelling and pagination.
         // erase first
         nvs_partition.erase(SECTOR_START, SECTOR_END).unwrap();
@@ -71,7 +71,7 @@ pub async fn persistence(flash: peripherals::FLASH<'static>) -> ! {
 pub async fn load_previous_wifi<'a>(
     nvs_partition: &mut FlashRegion<'_, FlashStorage<'_>>,
 ) -> Result<WifiConfig, anyhow::Error> {
-    let mut bytes = [0u8; 60];
+    let mut bytes = [0xff; 60];
     match nvs_partition.read(WIFI_CONFIG_ADDR, &mut bytes) {
         Ok(_) => info!("Read bytes {:02x}", &bytes),
         Err(x) => info!("Errror = {:?}", x),

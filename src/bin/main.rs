@@ -6,23 +6,27 @@
     holding buffers for the duration of a data transfer."
 )]
 
-use core::cell::RefCell;
+use core::cell::{Ref, RefCell};
 use core::cmp::Ordering;
 use core::net::Ipv4Addr;
 use core::result;
 
 use alloc::borrow::ToOwned;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::{self, Vec};
 use anyhow::Error;
 use defmt::info;
 use embassy_executor::Spawner;
+use embassy_futures::select;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Runner, StackResources};
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, RawMutex};
+use embassy_sync::channel::Receiver;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, WithTimeout};
 use embedded_io::Read;
 use esp_bootloader_esp_idf::partitions::{self, FlashRegion};
 use esp_hal::peripherals::{self, Peripherals, WIFI};
@@ -78,15 +82,19 @@ macro_rules! mk_static {
 //         - attempt to connect
 //           - if connection fails, try the next AP
 //           - if connection succeeds, the main loop will ping the web.
-//              - if pinging the web fails, it will send a disconnect signal
-//           - if we get the disconnect signal, try the next AP
-//       -
-//
+//           - one could likely integrate this ping behaviour
 
 /// used by the main loop to notify the connection state machine if this WG connected
 /// true when connected
 /// false when not connected
 pub static WG_CONNECT_STATUS: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+pub static SCAN_CMD: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+pub static SCAN_COMPLETE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+pub static DISCONNECT_DETECTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+pub static CANDIDATES: Mutex<CriticalSectionRawMutex, RefCell<Vec<WifiConfig>>> =
+    Mutex::new(RefCell::new(Vec::new()));
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -128,7 +136,13 @@ async fn main(spawner: Spawner) -> ! {
 
     // spawn other threads
     spawner.spawn(persistence(peripherals.FLASH)).ok();
-    spawner.spawn(connection(_wifi_controller)).ok();
+
+    let mut persisted_config = LOAD_WIFI.wait().await;
+    spawner
+        .spawn(wifi_mgr(_wifi_controller, persisted_config.clone()))
+        .ok();
+    spawner.spawn(best_connection_task(persisted_config)).ok();
+
     spawner.spawn(net_task(runner)).ok();
     // spawner.spawn(very_busy_loop()).ok();
 
@@ -178,7 +192,7 @@ async fn main(spawner: Spawner) -> ! {
             } else {
                 info!("Waiting to get ip addr");
 
-                Timer::after(Duration::from_millis(500)).await;
+                Timer::after(Duration::from_millis(5000)).await;
             }
         }
 
@@ -204,148 +218,200 @@ fn get_client_config_from_candidate(wifi: &WifiConfig) -> ClientConfig {
     }
 }
 
+enum WifiRequest {
+    Connect {
+        conf: WifiConfig,
+    },
+    Scan {
+        resp: oneshot::Sender<Vec<WifiConfig>>,
+    },
+}
+
+// actively searches for the best connection
 #[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) -> ! {
-    use alloc::vec;
-    info!("Start connection task");
+async fn best_connection_task(persisted_config: Option<WifiConfig>) -> ! {
+    // persistence will load the previous connection from flash, if any
+
+    let mut local_persisted = persisted_config.clone();
+    // on first boot, scan nearby wifis
+    SCAN_CMD.signal(());
+
+    let mut new_best_found = false;
+    loop {
+        if SCAN_COMPLETE.signaled() {
+            SCAN_COMPLETE.wait().await;
+            let candidates = CANDIDATES.lock().await;
+            let candidate_ref = candidates.borrow();
+            let best_candidate = candidate_ref.first();
+            info!("Scan complete, best = {}", best_candidate);
+            match (best_candidate, &local_persisted) {
+                (None, None) => {
+                    // no candidates and no persisted
+                }
+                (None, Some(x)) => {
+                    // no candidates, persisted still better
+                }
+                (Some(c), None) => {
+                    // a new winner emerges
+                    STORE_WIFI.signal(c.clone());
+                    local_persisted = Some(c.clone());
+                    new_best_found = true;
+                }
+                (Some(c), Some(p)) => {
+                    if c == p {
+                        // same as persisted,
+                        new_best_found = true;
+                    }
+                    if c > p {
+                        STORE_WIFI.signal(c.clone());
+                        local_persisted = Some(c.clone());
+                        new_best_found = true;
+                    }
+                }
+            }
+        }
+
+        {
+            match esp_radio::wifi::sta_state() {
+                wifi::WifiStaState::Connected => {
+                    // scan once an hour if we haven't found a new best
+                    if !new_best_found {
+                        match select::select(
+                            Timer::after(Duration::from_secs(60 * 60)),
+                            DISCONNECT_DETECTED.wait(),
+                        )
+                        .await
+                        {
+                            select::Either::First(_) => SCAN_CMD.signal(()),
+                            select::Either::Second(_) => {} // break,
+                        }
+                    }
+                }
+                wifi::WifiStaState::Disconnected => {
+                    // scan once every 5 minutes if we are currently chronically disconnected
+                    Timer::after(Duration::from_secs(5 * 60)).await;
+                    SCAN_CMD.signal(());
+                }
+                _ => {}
+            }
+        }
+        Timer::after(Duration::from_secs(10)).await
+    }
+}
+
+#[embassy_executor::task]
+async fn wifi_mgr(
+    mut controller: WifiController<'static>,
+    persisted_config: Option<WifiConfig>,
+) -> ! {
+    info!("Start wifi mgr task");
     info!("Device Capabilities: {:?}", controller.capabilities());
 
-    let default_config: ClientConfig = ClientConfig::default()
-        .with_ssid(KNOWN_CREDS.0.ssid.into())
-        .with_password(KNOWN_CREDS.0.password.into());
+    let default_config = if let Some(persist) = persisted_config {
+        get_client_config_from_candidate(&persist)
+    } else {
+        ClientConfig::default()
+            .with_ssid(KNOWN_CREDS.0.ssid.into())
+            .with_password(KNOWN_CREDS.0.password.into())
+    };
 
-    // persistence will load the previous connection from flash, if any
-    let persisted_config = LOAD_WIFI.wait().await;
-    let mut current_candidate: Option<WifiConfig> = None;
+    let client_config = ModeConfig::Client(default_config.clone());
 
-    let mut pick_new_candidate = true;
-    let mut scan = true;
-    // connection state machine
+    controller.set_config(&client_config).unwrap();
+
+    info!("Starting wifi");
+    controller.start_async().await.unwrap();
+    info!("Started wifi");
+
     loop {
         match esp_radio::wifi::sta_state() {
             wifi::WifiStaState::Connected => {
-                // todo: wait for disconnect event or check gateway status again
-                // a natural disconnect is okay, we can probably just try again
-                let natural_disconnect = controller.wait_for_event(WifiEvent::StaDisconnected);
-                // a signaled disconnect is the other loop informing that this WG doesn't provide reliable internet
-                let signal_disconnect = WG_CONNECT_STATUS.wait();
-                match embassy_futures::select::select(natural_disconnect, signal_disconnect).await {
-                    embassy_futures::select::Either::First(_) => {
-                        pick_new_candidate = true;
-                        info!("Detected disconnect");
-                    }
-                    embassy_futures::select::Either::Second(y) => match y {
-                        true => {
-                            info!("Candidate healthy");
-                            if let Some(ref mut x) = current_candidate {
-                                x.connect_success = Some(true);
-                            } else {
-                                // there is no candidate, but clearly we're connected to something
-                                // https://github.com/esp-rs/esp-hal/issues/4401
-                            };
-                            continue;
-                        }
-                        false => {
-                            if let Some(ref mut x) = current_candidate {
-                                x.connect_success = Some(false);
-                            }
-                            pick_new_candidate = true;
-                            info!("Detected network instability");
-                        }
-                    },
-                }
-
-                Timer::after(Duration::from_millis(5000)).await;
+                run_connected(&mut controller).await;
             }
-            // wifi::WifiStaState::Started => todo!(),
-            // wifi::WifiStaState::Disconnected => todo!(),
-            // wifi::WifiStaState::Stopped => todo!(),
-            // wifi::WifiStaState::Invalid => todo!(),
-            _ => {}
+
+            _ => run_disconnected(&mut controller).await,
         }
+        Timer::after(Duration::from_millis(3000)).await
+    }
+}
 
-        if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = ModeConfig::Client(default_config.clone());
-
-            controller.set_config(&client_config).unwrap();
-
-            info!("Starting wifi");
-            if let Err(x) = controller.start_async().await {
-                info!("Error = {:?}", x);
-            };
-            info!("Started wifi");
+async fn run_disconnected(controller: &mut WifiController<'static>) {
+    // we're currently disconnected
+    if SCAN_CMD.signaled() {
+        // clear signal
+        SCAN_CMD.wait().await;
+        do_scan(controller).await
+    }
+    info!("Currently disconnected");
+    // pick best next candidate
+    let candidates = CANDIDATES.lock().await;
+    let mut candidates_mut = candidates.borrow_mut();
+    if let Some(best) = candidates_mut.first() {
+        controller
+            .set_config(&ModeConfig::Client(get_client_config_from_candidate(best)))
+            .unwrap();
+        info!("Attempting to connect to {}", best);
+    }
+    match controller.connect_async().await {
+        Ok(_) => {
+            if let Some(best) = candidates_mut.first_mut() {
+                best.connect_success = Some(true);
+            }
+            info!("Wifi Connected!");
         }
-        if pick_new_candidate {
-            // scan nearby
-            // todo: do this at a regular cadence/ or when there are no candidates
-            let mut best_wgs: Vec<WifiConfig> = vec![];
-            best_wgs = scan_and_score_wgs(&mut controller).await;
-            // pick next candidate
-            current_candidate = pick_next_candidate(best_wgs.first(), current_candidate.as_ref());
-            info!("Candidate: {}", current_candidate);
-            if let Some(best) = &current_candidate {
-                STORE_WIFI.signal(best.clone());
-                controller
-                    .set_config(&ModeConfig::Client(get_client_config_from_candidate(&best)))
-                    .unwrap();
+        Err(err) => {
+            if let Some(best) = candidates_mut.first_mut() {
+                best.connect_success = Some(false);
             }
-
-            // need to timeout on this connect
-            info!("About to connect ...");
-            match controller.connect_async().await {
-                Ok(_) => {
-                    info!("Wifi Connected!");
-                }
-                Err(err) => {
-                    info!("Failed to connect to wifi {:?}", err);
-                    if let Some(ref mut x) = current_candidate {
-                        // normally we would reserve connect success for an internet connection
-                        x.connect_success = Some(false);
-                    }
-                    Timer::after(Duration::from_millis(5000)).await;
-                }
-            }
-        } else {
-            Timer::after(Duration::from_millis(5000)).await;
+            info!("Failed to connect to wifi {:?}", err);
         }
     }
 }
 
-fn pick_next_candidate(
-    scanned: Option<&WifiConfig>,
-    current_candidate: Option<&WifiConfig>,
-) -> Option<WifiConfig> {
-    let current = match (scanned, current_candidate) {
-        (None, None) => {
-            // there are no valid candidates :-| ,
-            None
-        }
-        (None, Some(x)) => {
-            // the persisted config was not found in the scan
-            Some(x.clone())
-        }
-        (Some(x), None) => {
-            // there was no persisted config, a new winner emerges
-            Some(x.clone())
-        }
-        (Some(scanned_best), Some(previous_best)) => {
-            // there is candidate, and a persisted config
-            if scanned_best == previous_best {
-                // lo, it's the same config
-                return current_candidate.cloned();
-            }
-            // scanned is better, we should use that
-            if scanned_best > previous_best {
-                Some(scanned_best.clone())
-            }
-            // persisted is better
-            else {
-                Some(previous_best.clone())
-            }
-        }
-    };
+async fn run_connected(
+    controller: &mut WifiController<'static>,
+    // candidates: &mut [WifiConfig; 10],
+) {
+    info!("Connected, waiting for disconnect or scan");
+    let disconnect_evt = controller.wait_for_event(WifiEvent::StaDisconnected);
 
-    current
+    let scan_event = SCAN_CMD.wait();
+
+    match select::select(disconnect_evt, scan_event).await {
+        select::Either::First(_) => {
+            // we're disconnected, pick the next gateway
+            let candidates = CANDIDATES.lock().await;
+            // candidates.borrow_mut().first_mut()
+            let mut candidates_mut = candidates.borrow_mut();
+            if let Some(old_best) = candidates_mut.first_mut() {
+                old_best.connect_success = Some(false);
+            }
+            candidates_mut.sort();
+            DISCONNECT_DETECTED.signal(());
+            // new best
+        }
+        select::Either::Second(_) => {
+            do_scan(controller).await;
+        }
+    }
+}
+
+async fn do_scan(controller: &mut WifiController<'static>) {
+    let mut wg = scan_and_score_wgs(controller).await;
+    let candidates = CANDIDATES.lock().await;
+    let mut candidates_mut = candidates.borrow_mut();
+
+    for w in &mut wg {
+        match candidates_mut.binary_search_by_key(&w.bssid, |w| w.bssid) {
+            Ok(x) => w.connect_success = candidates_mut[x].connect_success,
+            Err(_) => {}
+        }
+    }
+    // replace candidates
+    wg.sort();
+    *candidates_mut = wg;
+
+    SCAN_COMPLETE.signal(());
 }
 
 /// this can be enabled to show that our very busy loop can still run at a decent rate

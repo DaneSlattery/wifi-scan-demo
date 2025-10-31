@@ -2,7 +2,11 @@
 
 use core::{cell::RefCell, cmp::Ordering};
 
-use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use alloc::{
+    borrow::ToOwned,
+    string::{String, ToString},
+    vec::Vec,
+};
 use defmt::{Format, info};
 use embassy_sync::{
     blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
@@ -27,8 +31,17 @@ pub struct WifiConfig {
 }
 
 impl WifiConfig {
+    pub const fn new_default() -> Self {
+        return Self {
+            bssid: [0; 6],
+            ssid: heapless::String::new(),
+            signal_strength: i8::MIN,
+            connect_success: Some(false),
+        };
+    }
     fn cmp_ss(&self, other: &Self) -> core::cmp::Ordering {
-        return self.signal_strength.cmp(&other.signal_strength);
+        // we reverse because -20
+        return self.signal_strength.cmp(&other.signal_strength).reverse();
     }
 }
 impl PartialEq for WifiConfig {
@@ -40,48 +53,56 @@ impl PartialEq for WifiConfig {
 impl Ord for WifiConfig {
     fn cmp(&self, other: &Self) -> Ordering {
         // a wifi config
-        match (self.connect_success, other.connect_success) {
+        let a = match (self.connect_success, other.connect_success) {
             (Some(true), Some(true)) => {
                 // both configs connected, better signal wins
-                return Self::cmp_ss(&self, other);
+                Self::cmp_ss(&self, other)
             }
             (Some(true), Some(false)) => {
                 // self connected, we're better
-                return core::cmp::Ordering::Greater;
+                core::cmp::Ordering::Greater
             }
             (Some(false), Some(true)) => {
                 // other connected, self didn't, it's better
-                return Ordering::Less;
+                Ordering::Less
             }
             (Some(false), Some(false)) => {
                 // neither connected, better signals wins
-                return Self::cmp_ss(&self, other);
+                Self::cmp_ss(&self, other)
             }
             (None, None) => {
                 // never been used
-                return Self::cmp_ss(&self, other);
+                Self::cmp_ss(&self, other)
             }
             (None, Some(true)) => {
                 // self never been used, other connected, it's better
-                return Ordering::Less;
+                Ordering::Less
             }
             (None, Some(false)) => {
                 // self never been used, other didn't connect, we're better
-                return Ordering::Greater;
+                Ordering::Greater
             }
             (Some(x), None) => {
                 match x {
                     true => {
                         // self been used, and it connected, we're better
-                        return Ordering::Greater;
+                        Ordering::Greater
                     }
                     false => {
                         // self been used, and it didn't connect, rather use other
-                        return Ordering::Less;
+                        Ordering::Less
                     }
                 }
             }
-        }
+        };
+
+        let res = match &a {
+            Ordering::Less => "<",
+            Ordering::Equal => "==",
+            Ordering::Greater => ">",
+        };
+        info!("Compared {:?} to {:?}, result = {:?}", self, other, res);
+        return a;
     }
 }
 
@@ -129,8 +150,7 @@ pub async fn scan_and_score_wgs(controller: &mut WifiController<'static>) -> Vec
 
     // the best wifi candidate will sort to the top, check the Ord impl for
     // how they're picked
-    result.sort_by(|x, y| y.cmp(&x));
-
+    result.sort();
     for ap in &result {
         // show all aps nearby
         info!(
