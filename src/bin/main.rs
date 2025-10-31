@@ -386,7 +386,7 @@ async fn run_connected(
             if let Some(old_best) = candidates_mut.first_mut() {
                 old_best.connect_success = Some(false);
             }
-            candidates_mut.sort();
+            candidates_mut.sort_by(|x, y| x.cmp(y));
             DISCONNECT_DETECTED.signal(());
             // new best
         }
@@ -408,7 +408,7 @@ async fn do_scan(controller: &mut WifiController<'static>) {
         }
     }
     // replace candidates
-    wg.sort();
+    wg.sort_by(|x, y| x.cmp(y));
     *candidates_mut = wg;
 
     SCAN_COMPLETE.signal(());
