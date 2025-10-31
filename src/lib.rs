@@ -150,7 +150,7 @@ pub async fn scan_and_score_wgs(controller: &mut WifiController<'static>) -> Vec
 
     // the best wifi candidate will sort to the top, check the Ord impl for
     // how they're picked
-    result.sort();
+    result.sort_by(|x, y| x.cmp(y));
     for ap in &result {
         // show all aps nearby
         info!(
