@@ -15,7 +15,7 @@ The local Cargo config includes a runner that calls `espflash` with defmt suppor
 
 - Build (release):
 ```sh
-cargo build --release
+cargo run --release
 ```
 
 ## Working Principle
