@@ -14,7 +14,7 @@ use embassy_sync::{
     signal::Signal,
 };
 use embassy_time::{Delay, Duration, Timer};
-use esp_radio::wifi::{AccessPointInfo, ScanConfig, WifiController};
+use esp_radio::wifi::{AccessPointInfo, ClientConfig, ScanConfig, WifiController};
 use serde::{Deserialize, Serialize};
 
 pub mod persistence;
@@ -41,7 +41,7 @@ impl WifiConfig {
     }
     fn cmp_ss(&self, other: &Self) -> core::cmp::Ordering {
         // we reverse because -20
-        return self.signal_strength.cmp(&other.signal_strength).reverse();
+        return self.signal_strength.cmp(&other.signal_strength);
     }
 }
 impl PartialEq for WifiConfig {
@@ -96,12 +96,6 @@ impl Ord for WifiConfig {
             }
         };
 
-        let res = match &a {
-            Ordering::Less => "<",
-            Ordering::Equal => "==",
-            Ordering::Greater => ">",
-        };
-        info!("Compared {:?} to {:?}, result = {:?}", self, other, res);
         return a;
     }
 }
@@ -118,7 +112,7 @@ pub const KNOWN_CREDS: (Credential, Credential) = (
         password: PASSWORD,
     },
     Credential {
-        ssid: PASSWORD,
+        ssid: SSID2,
         password: PASSWORD2,
     },
 );
@@ -150,7 +144,8 @@ pub async fn scan_and_score_wgs(controller: &mut WifiController<'static>) -> Vec
 
     // the best wifi candidate will sort to the top, check the Ord impl for
     // how they're picked
-    result.sort_by(|x, y| x.cmp(y));
+    result.sort_by(|x, y| x.cmp(y).reverse());
+
     for ap in &result {
         // show all aps nearby
         info!(
@@ -162,4 +157,19 @@ pub async fn scan_and_score_wgs(controller: &mut WifiController<'static>) -> Vec
     }
 
     result
+}
+
+/// we use the bssid to identify a specific WG, as multiple will advertise on same ssid
+pub fn get_client_config_from_candidate(wifi: &WifiConfig) -> ClientConfig {
+    if wifi.ssid == KNOWN_CREDS.0.ssid {
+        ClientConfig::default()
+            .with_ssid(KNOWN_CREDS.0.ssid.into())
+            .with_bssid(wifi.bssid)
+            .with_password(KNOWN_CREDS.0.password.into())
+    } else {
+        ClientConfig::default()
+            .with_ssid(KNOWN_CREDS.1.ssid.into())
+            .with_bssid(wifi.bssid)
+            .with_password(KNOWN_CREDS.1.password.into())
+    }
 }

@@ -2,7 +2,7 @@ use anyhow::Error;
 use defmt::info;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::{Duration, Timer};
-use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
+use embedded_storage::nor_flash::{self, NorFlash, NorFlashErrorKind, ReadNorFlash};
 use esp_bootloader_esp_idf::partitions::{self, FlashRegion};
 use esp_hal::peripherals;
 use esp_storage::FlashStorage;
@@ -46,7 +46,7 @@ pub async fn persistence(flash: peripherals::FLASH<'static>) -> ! {
 
     // notify connection thread
     LOAD_WIFI.signal(conf);
-    let mut bytes = [0xff; 60];
+    let mut bytes = [0xff; 64];
     loop {
         info!("Waiting for new persistence");
         let conf: WifiConfig = STORE_WIFI.wait().await;
@@ -57,10 +57,21 @@ pub async fn persistence(flash: peripherals::FLASH<'static>) -> ! {
         // erase first
         nvs_partition.erase(SECTOR_START, SECTOR_END).unwrap();
         match postcard::to_slice::<WifiConfig>(&conf, &mut bytes) {
-            Ok(x) => match nvs_partition.write(WIFI_CONFIG_ADDR, &x) {
-                Ok(_) => info!("Write success {:02x}", x),
-                Err(y) => info!("Write error: {}", y),
-            },
+            Ok(x) => {
+                match nor_flash::check_write(&nvs_partition, WIFI_CONFIG_ADDR, x.len()) {
+                    Ok(_) => info!("Write success {:02x}", x),
+                    Err(y) => match y {
+                        NorFlashErrorKind::NotAligned => info!("Write error: not aligned"),
+                        NorFlashErrorKind::OutOfBounds => info!("Write error: OOB"),
+                        NorFlashErrorKind::Other => info!("Write error: other"),
+                        _ => todo!(),
+                    },
+                }
+                match nvs_partition.write(WIFI_CONFIG_ADDR, &bytes) {
+                    Ok(_) => info!("Write success {:02x}", bytes),
+                    Err(y) => info!("Write error: {}", y),
+                }
+            }
             Err(y) => info!("Error : {:?}", y),
         }
         Timer::after(Duration::from_millis(5000)).await;

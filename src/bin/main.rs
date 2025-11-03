@@ -6,48 +6,31 @@
     holding buffers for the duration of a data transfer."
 )]
 
-use core::cell::{Ref, RefCell};
-use core::cmp::Ordering;
+use core::cell::RefCell;
 use core::net::Ipv4Addr;
-use core::result;
 
-use alloc::borrow::ToOwned;
-use alloc::rc::Rc;
-use alloc::string::{String, ToString};
-use alloc::sync::Arc;
-use alloc::vec::{self, Vec};
-use anyhow::Error;
+use alloc::vec::Vec;
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_futures::select;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Runner, StackResources};
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, RawMutex};
-use embassy_sync::channel::Receiver;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer, WithTimeout};
-use embedded_io::Read;
-use esp_bootloader_esp_idf::partitions::{self, FlashRegion};
-use esp_hal::peripherals::{self, Peripherals, WIFI};
+use embassy_time::{Duration, Timer};
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::{clock::CpuClock, rng::Rng};
-use esp_radio::wifi::{
-    AccessPointInfo, ModeConfig, ScanConfig, WifiController, WifiDevice, WifiEvent,
-};
+use esp_radio::wifi::{ModeConfig, WifiController, WifiDevice, WifiEvent};
 use esp_radio::{
     Controller,
     wifi::{self, ClientConfig},
 };
-use esp_rtos::embassy;
-use esp_storage::FlashStorage;
-use ieee80211::{match_frames, mgmt_frame::BeaconFrame};
-use serde::{Deserialize, Serialize};
 use wifi_scan_demo::persistence::{LOAD_WIFI, STORE_WIFI, persistence};
-use wifi_scan_demo::{KNOWN_CREDS, WifiConfig, scan_and_score_wgs};
+use wifi_scan_demo::{
+    KNOWN_CREDS, WifiConfig, get_client_config_from_candidate, scan_and_score_wgs,
+};
 use {esp_backtrace as _, esp_println as _};
-
-use embedded_storage::{ReadStorage, Storage};
 
 // use wifi_scan_demo::{WIFI_STARTED, scanner};
 extern crate alloc;
@@ -65,24 +48,6 @@ macro_rules! mk_static {
         x
     }};
 }
-
-// the system works as follows:
-// 1. start persistence loop
-//    - persistence loop will read NVS and fetch most recent connected access point, by bssid
-//      if one is not found, take the default as the starting config.
-//      Persistence then posts to a signal to notify other tasks that the wifi config is loaded
-// 2. start connect loop
-//    - connect loop will wait for persistence signal and then use those credentials to initialise the wifi
-//    - on first boot:
-//       - start wifi
-//       - connect loop will then scan up to 10 nearby AP's matching either of the known ssids
-//       - it will rank the nearby APs by signal strength (higher is better)
-//       - if the persisted config is there, it will rank that highest, so attempt that first
-//       - we can then go down the list of APs starting at the highest rank,
-//         - attempt to connect
-//           - if connection fails, try the next AP
-//           - if connection succeeds, the main loop will ping the web.
-//           - one could likely integrate this ping behaviour
 
 /// used by the main loop to notify the connection state machine if this WG connected
 /// true when connected
@@ -137,7 +102,7 @@ async fn main(spawner: Spawner) -> ! {
     // spawn other threads
     spawner.spawn(persistence(peripherals.FLASH)).ok();
 
-    let mut persisted_config = LOAD_WIFI.wait().await;
+    let persisted_config = LOAD_WIFI.wait().await;
     spawner
         .spawn(wifi_mgr(_wifi_controller, persisted_config.clone()))
         .ok();
@@ -200,31 +165,6 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     info!("Something went terribly wrong");
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.1/examples/src/bin
-}
-
-/// we use the bssid to identify a specific WG, as multiple will advertise on same ssid
-fn get_client_config_from_candidate(wifi: &WifiConfig) -> ClientConfig {
-    if wifi.ssid == KNOWN_CREDS.0.ssid {
-        ClientConfig::default()
-            .with_ssid(KNOWN_CREDS.0.ssid.into())
-            .with_bssid(wifi.bssid)
-            .with_password(KNOWN_CREDS.0.password.into())
-    } else {
-        ClientConfig::default()
-            .with_ssid(KNOWN_CREDS.1.ssid.into())
-            .with_bssid(wifi.bssid)
-            .with_password(KNOWN_CREDS.1.password.into())
-    }
-}
-
-enum WifiRequest {
-    Connect {
-        conf: WifiConfig,
-    },
-    Scan {
-        resp: oneshot::Sender<Vec<WifiConfig>>,
-    },
 }
 
 // actively searches for the best connection
@@ -381,12 +321,13 @@ async fn run_connected(
         select::Either::First(_) => {
             // we're disconnected, pick the next gateway
             let candidates = CANDIDATES.lock().await;
-            // candidates.borrow_mut().first_mut()
             let mut candidates_mut = candidates.borrow_mut();
+            // update the old best, noting the disconnect
             if let Some(old_best) = candidates_mut.first_mut() {
                 old_best.connect_success = Some(false);
             }
-            candidates_mut.sort_by(|x, y| x.cmp(y));
+            // re-sort the candidates
+            candidates_mut.sort_by(|x, y| x.cmp(y).reverse());
             DISCONNECT_DETECTED.signal(());
             // new best
         }
@@ -408,7 +349,7 @@ async fn do_scan(controller: &mut WifiController<'static>) {
         }
     }
     // replace candidates
-    wg.sort_by(|x, y| x.cmp(y));
+    wg.sort_by(|x, y| x.cmp(y).reverse());
     *candidates_mut = wg;
 
     SCAN_COMPLETE.signal(());
