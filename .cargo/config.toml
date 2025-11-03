@@ -4,10 +4,12 @@ runner = "espflash flash --monitor --chip esp32 --log-format defmt"
 [env]
 DEFMT_LOG="info"
 
-SSID = "Polar Monitoring"
-PASSWORD = "Polar1234"
-SSID2 = "EMWIFI"
-PASSWORD2 = "EME2015!1"
+# max ssid: 32 chars
+# max password: 64 chars
+SSID = "EddieIzzard"
+PASSWORD = "would like a tray"
+SSID2 = "Why would I commit my wifi credentials?"
+PASSWORD2 = "and push it to a public repo?"
 STATIC_IP = "1.1.1.1 "
 GATEWAY_IP = "1.1.1.1"
 HOST_IP = "1.1.1.1"

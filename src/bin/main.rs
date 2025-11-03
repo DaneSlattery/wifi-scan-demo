@@ -32,7 +32,6 @@ use wifi_scan_demo::{
 };
 use {esp_backtrace as _, esp_println as _};
 
-// use wifi_scan_demo::{WIFI_STARTED, scanner};
 extern crate alloc;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -308,10 +307,7 @@ async fn run_disconnected(controller: &mut WifiController<'static>) {
     }
 }
 
-async fn run_connected(
-    controller: &mut WifiController<'static>,
-    // candidates: &mut [WifiConfig; 10],
-) {
+async fn run_connected(controller: &mut WifiController<'static>) {
     info!("Connected, waiting for disconnect or scan");
     let disconnect_evt = controller.wait_for_event(WifiEvent::StaDisconnected);
 

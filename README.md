@@ -50,3 +50,8 @@ cargo run --release
 - `DISCONNECT_DETECTED` — used to adapt scan frequency after disconnects.
 - The network stack runs in `net_task` and the main loop tries TCP connectivity to 
 `1.1.1.1:80` to validate internet connectivity.
+
+
+6. Very busy loop
+- The very busy loop can be enabled to show that there is little-to-no blocking code, and everything runs co-operatively
+ src/bin/main.rs:111
